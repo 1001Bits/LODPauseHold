@@ -1,0 +1,19 @@
+# Build output (includes the vcpkg_installed tree — ~285 MB)
+build/
+
+# Release staging and packaged archives. Binaries belong on the Releases page,
+# not in the tree.
+package/
+dist/
+
+# Test captures from live debugging sessions. These are raw logs from a
+# particular machine and include local install paths; they are kept locally for
+# reference but are not part of the source.
+evidence/
+*.log
+
+# Editor / tooling
+.claude/
+.vs/
+.vscode/
+CMakeUserPresets.json
