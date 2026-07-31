@@ -17,7 +17,10 @@ namespace slh::MenuWatcher
         std::atomic<std::int64_t>  g_lastOpenMs{ 0 };
         std::atomic<std::int64_t>  g_lastCloseMs{ 0 };
 
-        std::thread             g_thread;
+        // Started detached; no std::thread object is kept. A static
+        // std::thread left joinable at DLL_PROCESS_DETACH static destruction
+        // calls std::terminate — see the matching comment in Hook.cpp.
+        std::atomic<bool>       g_started{ false };
         std::atomic<bool>       g_shutdown{ false };
         std::vector<std::string> g_configuredMenus;
 
@@ -182,6 +185,28 @@ namespace slh::MenuWatcher
                 const auto now = std::chrono::steady_clock::now();
 
                 UpdateQuitRequested();
+
+                // Once the engine wants to quit, this thread STOPS ENTIRELY.
+                //
+                // Latching the flag was not enough. QueryEnginePauseMenu below
+                // calls the engine's UI::IsMenuOpen every 10ms on a background
+                // thread; continuing to do that while the game dismantles its
+                // UI means calling into subsystems that are being destroyed,
+                // and contending for their locks exactly when shutdown wants
+                // them. A tester A/B'd a slow exit that stopped when the plugin
+                // was removed, with the LOD redirects already guarded — this
+                // polling was the remaining engine contact.
+                //
+                // Returning also ends the thread, so nothing of ours is left
+                // running for the rest of the shutdown.
+                if (g_quitRequested.load(std::memory_order_relaxed)) {
+                    g_enginePauseMenu.store(false, std::memory_order_relaxed);
+                    g_menuOpen.store(false, std::memory_order_release);
+                    spdlog::info("[menu] watcher stopped — no further engine calls will be made "
+                                 "from this plugin during shutdown");
+                    return;
+                }
+
                 g_foreground.store(ForegroundIsOurProcess(), std::memory_order_relaxed);
                 const bool enginePauseMenu = QueryEnginePauseMenu();
                 g_enginePauseMenu.store(enginePauseMenu, std::memory_order_relaxed);
@@ -352,14 +377,14 @@ namespace slh::MenuWatcher
 
     void Start()
     {
-        if (g_thread.joinable()) return;
+        if (g_started.exchange(true)) return;
         g_shutdown.store(false);
-        g_thread = std::thread(PollLoop);
+        std::thread(PollLoop).detach();
     }
 
     void Stop()
     {
+        // Detached thread: signal only; it exits within one poll interval.
         g_shutdown.store(true);
-        if (g_thread.joinable()) g_thread.join();
     }
 }

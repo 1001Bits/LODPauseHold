@@ -130,9 +130,12 @@ namespace
             else if (level == "info")  log->set_level(spdlog::level::info);
             else if (level == "warn")  log->set_level(spdlog::level::warn);
             else if (level == "error") log->set_level(spdlog::level::err);
+            // flush_on already writes every line through, so a periodic
+            // flusher would add nothing but a third thread taking the sink
+            // lock — including during shutdown, which is exactly what we are
+            // trying to keep clear. Deliberately not using spdlog::flush_every.
             log->flush_on(spdlog::level::info);
             spdlog::set_default_logger(log);
-            spdlog::flush_every(std::chrono::seconds(2));
         } catch (...) {
             // can't even open log — nothing we can do; press on silently
         }
@@ -220,8 +223,22 @@ namespace
         // state while exact PauseMenu is open.
         c.hook.freezeLODWhilePaused = readBool(
             L"Fix", L"bFreezeLODWhilePaused", c.hook.freezeLODWhilePaused);
+        c.hook.fastExit = readBool(L"Quit", L"bFastExit", c.hook.fastExit);
+        c.hook.fastExitEvenIfCacheDirty = readBool(
+            L"Quit", L"bFastExitEvenIfCacheDirty", c.hook.fastExitEvenIfCacheDirty);
+
         c.hook.requireValidBudgetForFreeze = readBool(
             L"Safety", L"bRequireValidBudgetForFreeze", c.hook.requireValidBudgetForFreeze);
+        c.hook.maxFreezeMode = std::clamp(
+            // Capped at 2, same policy as iMaxHoldMode: a value of 3 would
+            // disable the mode half of the pressure gate entirely, and holding
+            // the freeze through a mode-3 emergency is the failure the gate
+            // exists to prevent.
+            readInt(L"Safety", L"iMaxFreezeMode", c.hook.maxFreezeMode), 0, 2);
+        c.hook.minFreezeHeadroomBytes =
+            static_cast<std::uint64_t>(std::max(
+                0, readInt(L"Safety", L"iMinFreezeHeadroomMB",
+                           static_cast<int>(c.hook.minFreezeHeadroomBytes >> 20)))) << 20;
 
         // Legacy budget experiments retained for controlled A/B tests.
         c.hook.clearRefreshAll        = readBool(L"Fix", L"bClearRefreshAll", c.hook.clearRefreshAll);
@@ -257,7 +274,8 @@ namespace
         // Diagnostics.
         c.hook.logTimeline      = readBool(L"Logging", L"bLogTimeline", c.hook.logTimeline);
         c.hook.timelinePeriodMs = static_cast<std::uint32_t>(
-            readInt(L"Logging", L"iTimelinePeriodMs", static_cast<int>(c.hook.timelinePeriodMs)));
+            std::max(0, readInt(L"Logging", L"iTimelinePeriodMs",
+                                static_cast<int>(c.hook.timelinePeriodMs))));
         if (c.hook.timelinePeriodMs < 50) c.hook.timelinePeriodMs = 50;
         c.hook.summaryIntervalMs = static_cast<std::uint32_t>(std::clamp(
             readInt(L"Logging", L"iSummaryIntervalMs",
@@ -266,13 +284,15 @@ namespace
         // Safety envelope — see Hook.h for what each gate protects against.
         c.hook.maxSuppressMode      = readInt (L"Safety", L"iMaxHoldMode",        c.hook.maxSuppressMode);
         c.hook.abortOnEscalation    = readBool(L"Safety", L"bAbortOnEscalation",  c.hook.abortOnEscalation);
-        c.hook.maxSuppressMsPerMenu = static_cast<std::uint32_t>(
-            readInt(L"Safety", L"iMaxHoldMsPerMenu", static_cast<int>(c.hook.maxSuppressMsPerMenu)));
+        // max(0, …) before every uint cast: a negative INI value would
+        // otherwise wrap to ~4.29e9 and read as "practically forever".
+        c.hook.maxSuppressMsPerMenu = static_cast<std::uint32_t>(std::max(0,
+            readInt(L"Safety", L"iMaxHoldMsPerMenu", static_cast<int>(c.hook.maxSuppressMsPerMenu))));
         c.hook.watchdogEnabled      = readBool(L"Safety", L"bWatchdogEnabled",    c.hook.watchdogEnabled);
         c.hook.watchdogRatio        = static_cast<float>(
             readInt(L"Safety", L"iWatchdogPercent", 50)) / 100.0f;
-        c.hook.watchdogTripMs       = static_cast<std::uint32_t>(
-            readInt(L"Safety", L"iWatchdogTripMs", static_cast<int>(c.hook.watchdogTripMs)));
+        c.hook.watchdogTripMs       = static_cast<std::uint32_t>(std::max(0,
+            readInt(L"Safety", L"iWatchdogTripMs", static_cast<int>(c.hook.watchdogTripMs))));
 
         // Clamp anything a hand-edited INI could put out of range. iMaxHoldMode
         // above 1 re-enables the exact write that caused the v0.4 stall, so it
@@ -325,10 +345,14 @@ extern "C" __declspec(dllexport) bool SFSEAPI SFSEPlugin_Load(const SFSE_LoadInt
     auto cfg = LoadConfig();
     SetupLogging(cfg.logLevel);
 
+#ifdef SLH_DIAGNOSTIC_BUILD
+    spdlog::warn("*** DIAGNOSTIC BUILD — verbose logging is compiled in. This log grows by "
+                 "roughly 10 MB per four hours of play; that is expected, not a fault. ***");
+#endif
     spdlog::info("=== StarfieldPauseLODHold v{}.{}.{} loading ===",
                  (slh::kPluginVersion >> 24) & 0xff,
                  (slh::kPluginVersion >> 16) & 0xff,
-                 slh::kPluginVersion & 0xff);
+                 (slh::kPluginVersion >> 4) & 0xfff);   // packing is patch<<4 | build
     spdlog::info("SFSE version reported = 0x{:08x}, runtime = 0x{:08x}, isEditor = {}",
                  a_sfse ? a_sfse->sfseVersion : 0,
                  a_sfse ? a_sfse->runtimeVersion : 0,
@@ -366,9 +390,19 @@ extern "C" __declspec(dllexport) bool SFSEAPI SFSEPlugin_Load(const SFSE_LoadInt
                      "[Logging]  bLogTimeline = 1");
     }
     spdlog::info("[config] fix: freezeLODWhilePaused={} (exact PauseMenu only)  "
-                 "teardown guard: game-window liveness (no time limit on a pause)"
-                 "  requireValidBudget={}",
+                 "teardown guard: engine quit flag  requireValidBudget={}",
                  cfg.hook.freezeLODWhilePaused, cfg.hook.requireValidBudgetForFreeze);
+    spdlog::info("[config] fast quit to desktop: {}{}",
+                 cfg.hook.fastExit ? "on" : "off",
+                 cfg.hook.fastExit
+                     ? (cfg.hook.fastExitEvenIfCacheDirty
+                            ? " (unconditional — may drop new shaders from the cache)"
+                            : " (only when the shader cache has nothing new to save)")
+                     : "");
+    spdlog::info("[config] VRAM pressure gate: freeze only at budget mode <= {} and with "
+                 ">= {}MB headroom under the engine's texture target; stands down for the rest "
+                 "of a pause if the engine needs to shed",
+                 cfg.hook.maxFreezeMode, cfg.hook.minFreezeHeadroomBytes >> 20);
     spdlog::info("[config] legacy: clearRefreshAll={} holdUpgradeBudgets={} "
                  "(+{}ms post-close) pressureGuard={} (enter/exit={}MB/{}MB)",
                  cfg.hook.clearRefreshAll, cfg.hook.holdUpgradeBudgets,
@@ -412,25 +446,19 @@ extern "C" __declspec(dllexport) bool SFSEAPI SFSEPlugin_Load(const SFSE_LoadInt
 // worker or hook, so a non-process detach cannot occur after installation.
 // At process termination Windows has already stopped the other threads; only
 // lock-free counter reads and final logging remain.
-BOOL WINAPI DllMain(HMODULE, DWORD reason, LPVOID lpReserved)
+BOOL WINAPI DllMain(HMODULE, DWORD reason, LPVOID)
 {
-    if (reason == DLL_PROCESS_DETACH) {
-        const bool processExiting = (lpReserved != nullptr);
-        spdlog::info("=== DLL_PROCESS_DETACH (process_exit={}) ===", processExiting);
-        if (processExiting) {
-            // Lock-free reads of the atomics — safe with the other threads gone.
-            const auto c = slh::Hook::SnapshotCounters();
-            spdlog::info("[hook] final — totalCalls={}, pausedStateSkips={}, postPauseResets={}, "
-                         "degradeHolds={}, refreshClears={}, upgradeCaps={}, passed={}  "
-                         "mode histogram[0/1/2/3]={}/{}/{}/{}",
-                         c.totalCalls, c.pausedStateSkips, c.postPauseResets,
-                         c.suppressedCalls, c.refreshClears,
-                         c.upgradeBudgetCaps, c.passedCalls,
-                         c.modeHistogram[0], c.modeHistogram[1],
-                         c.modeHistogram[2], c.modeHistogram[3]);
-            slh::Hook::LogFinalVerdict();
-        }
-        spdlog::shutdown();
-    }
+    // Deliberately does nothing.
+    //
+    // DLL_PROCESS_DETACH runs under the loader lock, after Windows has already
+    // terminated our worker threads wherever they happened to be — possibly
+    // inside the log sink's mutex, which would then never be released. Logging
+    // here can therefore deadlock the process on exit, and the plugin has no
+    // way to know whether it is about to.
+    //
+    // Nothing is lost by staying silent: the diagnostics thread now writes the
+    // final verdict and flushes the moment the engine's quit flag is set, which
+    // happens seconds earlier and while the process is still healthy.
+    (void)reason;
     return TRUE;
 }

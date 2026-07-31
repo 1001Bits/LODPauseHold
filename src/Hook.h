@@ -52,6 +52,23 @@ namespace slh::Hook
         // promotion or degradation batch executes during the pause.
         bool freezeLODWhilePaused = true;
 
+        // ── Fast quit to desktop ─────────────────────────────────────────
+        // The engine's exit teardown re-serializes the entire D3D12 pipeline
+        // cache (Pipeline.cache) and walks its whole heap — up to a minute on
+        // a large session. TerminateProcess skips all of it and closes the
+        // game instantly. Decompiled on 1.16.236: the ONLY file the teardown
+        // writes is Pipeline.cache (verified across 3,804 functions), and the
+        // engine already gates that write on its own "needs saving" byte. We
+        // read the same byte and only fast-exit when the engine itself would
+        // write nothing — so no shader cache can ever be lost. When new shaders
+        // WERE compiled this session, the byte is set, we skip the fast-exit,
+        // and the engine persists the cache normally that one time.
+        bool fastExit = true;
+        // If false, fast-exit unconditionally, even when the pipeline cache is
+        // dirty (this session's new shaders recompile next launch). Off by
+        // default so the smart, lossless behaviour above is what ships.
+        bool fastExitEvenIfCacheDirty = false;
+
         // ── Teardown safety ──────────────────────────────────────────────
         // Quitting to desktop is chosen FROM the pause menu, so the menu never
         // closes, the freeze never releases, and our detours would still be
@@ -70,6 +87,23 @@ namespace slh::Hook
         // not guaranteed to be the same on every build, so it stays as a
         // backstop that costs a couple of guarded reads.
         bool requireValidBudgetForFreeze = true;
+
+        // ── VRAM pressure gate ───────────────────────────────────────────
+        // Never hold the freeze while the engine is trying to recover VRAM.
+        // Every hooked state is redirected through Reset, which also zeroes
+        // totalDegrade, so a frozen engine cannot demote at all — and demotion
+        // is its only route back from pressure. Blocking it costs nothing while
+        // there is headroom, but under pressure each pause becomes a pause the
+        // engine could not use to recover, and usage ratchets up over a session.
+        //
+        // Freeze only at or below this budget mode. 0 = plenty of VRAM,
+        // 1 = light budgeting, 2 = real pressure, 3 = emergency.
+        int maxFreezeMode = 1;
+        // ...and only with at least this much room left under the engine's own
+        // texture target. Mode alone is not enough: mode 1 computes
+        // totalDegrade = max(usage - target, 34MB), so it can carry real
+        // overage while still reporting light budgeting.
+        std::uint64_t minFreezeHeadroomBytes = 128ull << 20;
 
         // ── Legacy intervention A: refreshAll clear (upgrade side) ───────
         // `UpgradeTextures::Func4` reads state+0x38c0 and, when it is set,
@@ -134,19 +168,29 @@ namespace slh::Hook
         // for everyone else. With it off the log still records startup, every
         // pause, the per-pause recovery report, and the periodic verdict, which
         // is what a report actually needs.
+        // A diagnostic build compiles the verbose defaults in, so a tester needs
+        // no INI at all — the DLL alone produces a usable log. Release builds
+        // stay quiet. See SLH_DIAGNOSTIC_BUILD in CMakeLists.txt.
+#ifdef SLH_DIAGNOSTIC_BUILD
+        bool          logTimeline     = true;
+        std::uint32_t summaryIntervalMs = 5000;
+#else
         bool          logTimeline     = false;
+        std::uint32_t summaryIntervalMs = 15000;
+#endif
         std::uint32_t timelinePeriodMs = 250;   // heartbeat; changes log immediately
         bool   dryRun           = false;
         bool   logEveryCall     = false;
-        std::uint32_t summaryIntervalMs = 15000;
         std::uint32_t verdictIntervalSec = 60;
     };
 
     bool Install(const Config& cfg);
     void Shutdown();
 
-    // Writes the "did the mass-upload path fire?" summary block. Called from
-    // Shutdown, and directly on process exit where joining threads is unsafe.
+    // Writes the "did the mass-upload path fire?" summary block. The live
+    // emission path is the diag thread (periodic, and once when the engine's
+    // quit flag is seen); DllMain is deliberately empty, so nothing runs at
+    // process detach. Shutdown() and this function currently have no callers.
     void LogFinalVerdict();
 
     struct Counters

@@ -9,7 +9,7 @@ set(VCPKG_TARGET_TRIPLET "x64-windows-static-md" CACHE STRING "")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE STRING "")
 
 project(StarfieldPauseLODHold
-    VERSION 1.0.0
+    VERSION 1.1.0
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -26,6 +26,15 @@ add_library(${PROJECT_NAME} SHARED
 )
 
 target_precompile_headers(${PROJECT_NAME} PRIVATE src/PCH.h)
+
+# Diagnostic build: compiles the verbose defaults in, so a tester build needs no
+# INI at all. OFF for anything shipped publicly — with it on the log grows by
+# roughly 10 MB per four hours of play.
+option(SLH_DIAGNOSTIC_BUILD "Compile in verbose diagnostic defaults (tester builds only)" OFF)
+if(SLH_DIAGNOSTIC_BUILD)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE SLH_DIAGNOSTIC_BUILD=1)
+    message(STATUS "*** DIAGNOSTIC BUILD — verbose logging compiled in, do not ship publicly ***")
+endif()
 
 # Dependencies (vcpkg-provided)
 find_package(spdlog CONFIG REQUIRED)
@@ -71,13 +80,25 @@ if(NOT DEFINED SF_DEPLOY_DIR)
         CACHE PATH "Deploy folder for SFSE plugin DLL")
 endif()
 
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+# The INI is NOT deployed by default: the mod ships DLL-only, and compiled
+# defaults (including SLH_DIAGNOSTIC_BUILD's verbose ones) are the intended
+# configuration. An auto-copied INI silently overrides them — that bit us when
+# a release INI in the deploy dir masked a diagnostic build's defaults.
+option(SLH_DEPLOY_INI "Also copy data/StarfieldPauseLODHold.ini to SF_DEPLOY_DIR" OFF)
+
+set(SLH_DEPLOY_COMMANDS
     COMMAND ${CMAKE_COMMAND} -E make_directory "${SF_DEPLOY_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:${PROJECT_NAME}>"
-        "${SF_DEPLOY_DIR}/$<TARGET_FILE_NAME:${PROJECT_NAME}>"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/data/StarfieldPauseLODHold.ini"
-        "${SF_DEPLOY_DIR}/StarfieldPauseLODHold.ini"
+        "${SF_DEPLOY_DIR}/$<TARGET_FILE_NAME:${PROJECT_NAME}>")
+if(SLH_DEPLOY_INI)
+    list(APPEND SLH_DEPLOY_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/data/StarfieldPauseLODHold.ini"
+            "${SF_DEPLOY_DIR}/StarfieldPauseLODHold.ini")
+endif()
+
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    ${SLH_DEPLOY_COMMANDS}
     COMMENT "Deployed to ${SF_DEPLOY_DIR}"
 )

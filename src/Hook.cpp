@@ -58,6 +58,8 @@ namespace slh::Hook
         std::atomic<bool>           g_loggedLatchThisSession{ false };
 
         std::atomic<std::uint64_t> g_teardownSkips{ 0 };      // redirects declined
+        std::atomic<std::uint64_t> g_pressureStandDowns{ 0 }; // declined for VRAM pressure
+        std::atomic<std::uint64_t> g_freezeStoodDownSession{ 0 };
 
         std::atomic<bool>   g_watchdogTripped{ false };
         std::atomic<double> g_baselineRate{ 0.0 };
@@ -66,7 +68,14 @@ namespace slh::Hook
         std::atomic<std::uint64_t> g_pendingPostPauseReset{ 0 };
         std::atomic<std::uint64_t> g_completedPostPauseReset{ 0 };
 
-        std::thread        g_diagThread;
+        // The diag thread is started DETACHED and no std::thread object is
+        // kept. A static std::thread that is still joinable when the CRT runs
+        // static destructors at DLL_PROCESS_DETACH calls std::terminate — and
+        // since the dormancy change the thread FINISHES on quit rather than
+        // running forever, which is exactly the joinable-but-done state that
+        // trips it. Starfield's usual TerminateProcess exit skips detach, but
+        // any ExitProcess-based exit (patch, another plugin, CRT exit()) would
+        // have aborted the game during shutdown and looked like our crash.
         std::atomic<bool>  g_shutdown{ false };
 
         std::int64_t NowMs() noexcept
@@ -121,6 +130,61 @@ namespace slh::Hook
             return b;
         }
 
+        // Pipeline-cache "needs saving" flag, off the same budget singleton.
+        // Chain verified on 1.16.236 (FUN_142a1c690, the exit teardown):
+        //   singleton = *g_budgetSingletonPtr           (AddrLib 944397)
+        //   renderer  = *(singleton + 0x30)
+        //   pipelineMgr = *(renderer + 0x560)
+        //   dirty     = *(pipelineMgr + 0x10)
+        // The engine serializes Pipeline.cache on exit iff this byte != 0.
+        // Returns 0 = clean (engine would write nothing), 1 = dirty, -1 =
+        // could not read. Fast-exit acts only on a clean 0 read, so a wrong
+        // offset on some other build fails safe: a fault or null returns -1
+        // and the game shuts down normally.
+        constexpr std::uintptr_t kRendererOffset    = 0x30;
+        constexpr std::uintptr_t kPipelineMgrOffset = 0x560;
+        constexpr std::uintptr_t kPipelineDirtyByte = 0x10;
+
+        int ReadPipelineCacheDirty() noexcept
+        {
+            if (g_budgetSingletonPtr == 0) return -1;
+            std::uintptr_t singleton = 0, renderer = 0, pipelineMgr = 0;
+            std::uint8_t dirty = 0;
+            if (!TryRead(g_budgetSingletonPtr, singleton) || singleton == 0) return -1;
+            if (!TryRead(singleton + kRendererOffset, renderer) || renderer == 0) return -1;
+            if (!TryRead(renderer + kPipelineMgrOffset, pipelineMgr) || pipelineMgr == 0) return -1;
+            if (!TryRead(pipelineMgr + kPipelineDirtyByte, dirty)) return -1;
+            return dirty != 0 ? 1 : 0;
+        }
+
+        std::atomic<bool> g_fastExitDone{ false };
+
+        // Called once, when the engine's quit flag is seen. Either terminates
+        // the process (instant close) or returns to let the normal shutdown run.
+        void MaybeFastExit() noexcept
+        {
+            if (!g_cfg.fastExit) return;
+            if (g_fastExitDone.exchange(true)) return;   // once only
+
+            if (!g_cfg.fastExitEvenIfCacheDirty) {
+                const int dirty = ReadPipelineCacheDirty();
+                if (dirty != 0) {
+                    spdlog::info("[quit] fast-exit skipped this once — {}; letting the engine "
+                                 "shut down normally so the shader cache persists",
+                                 dirty < 0 ? "could not read the pipeline-cache state"
+                                           : "new shaders were compiled this session");
+                    spdlog::default_logger()->flush();
+                    return;
+                }
+                spdlog::info("[quit] pipeline cache is clean — closing immediately "
+                             "(skipping the engine's slow teardown)");
+            } else {
+                spdlog::info("[quit] fast exit (unconditional)");
+            }
+            spdlog::default_logger()->flush();
+            ::TerminateProcess(::GetCurrentProcess(), 0);
+        }
+
         // ── Timeline ring ─────────────────────────────────────────────────
         // Written on the render thread, drained and formatted by the diag
         // thread. Nothing on the hot path ever touches the logger.
@@ -162,10 +226,14 @@ namespace slh::Hook
         std::atomic<std::uint64_t> g_lastSig{ ~0ull };
         std::atomic<std::int64_t>  g_lastSampleMs{ 0 };
 
-        // Six hooked states publish here. They are believed to all run on the
-        // renderer thread, but claiming an index atomically costs nothing and
-        // means a second producer would lose at most its own sample rather
-        // than silently overwriting another's.
+        // SINGLE-PRODUCER by assumption: all six hooked states run on the
+        // renderer thread (supported by ~218k observed samples with no
+        // corruption, but not proven). The claim/publish split does NOT make
+        // this multi-producer safe — g_ringPublished is a completion COUNT,
+        // not a contiguous watermark, so with two producers the drain could
+        // consume a slot the slower producer is still writing. If the
+        // single-thread assumption is ever disproven, this needs per-slot
+        // sequence numbers, not a bigger counter.
         void PushSample(const Sample& s) noexcept
         {
             const auto i = g_ringWrite.fetch_add(1, std::memory_order_relaxed);
@@ -316,6 +384,15 @@ namespace slh::Hook
                 // the likeliest cause is a mis-resolved address, in which case
                 // nothing was modified and the original state function is the
                 // correct thing to run instead.
+                //
+                // Known tradeoff: if Reset faulted PARTWAY (some fields already
+                // zeroed, state possibly destroyed), the caller falls back to
+                // the original Func4 in the same visit, which then runs against
+                // half-reset state. The alternative — skipping the visit — is
+                // worse: nothing would write *outNextState and the dispatcher
+                // would consume garbage. The original at least leaves the
+                // machine coherent, and the freeze is permanently off either
+                // way.
                 g_pauseFreezeReady.store(false, std::memory_order_release);
                 g_resetFaulted.store(true, std::memory_order_relaxed);
                 return false;
@@ -384,19 +461,81 @@ namespace slh::Hook
             if (pauseOpen) {
                 const std::int64_t now = NowMs();
 
-                // ── Teardown guard 1: is the LOD subsystem still there? ──
+                const BudgetRead bud = ReadBudget();
+
+                // ── Teardown guard: is the LOD subsystem still there? ──
                 // Quit-to-desktop is chosen from inside the pause menu, so the
                 // menu never closes and this branch keeps running while the
                 // engine dismantles itself. Redirecting into a native state
                 // transition at that point is a use-after-free waiting to
                 // happen. The budget singleton dies with the renderer, so if it
                 // no longer reads, hand control straight back to the engine.
-                if (g_cfg.requireValidBudgetForFreeze) {
-                    const BudgetRead probe = ReadBudget();
-                    if (!probe.valid || state == 0) {
-                        g_teardownSkips.fetch_add(1, std::memory_order_relaxed);
-                        return false;
+                if (g_cfg.requireValidBudgetForFreeze && (!bud.valid || state == 0)) {
+                    g_teardownSkips.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+
+                // ── VRAM pressure gate ────────────────────────────────────
+                // Demotion is the engine's ONLY route back from VRAM pressure,
+                // and the freeze blocks it along with everything else — every
+                // hooked state is redirected to Reset, which also zeroes
+                // totalDegrade, so a paused engine cannot shed a single byte.
+                //
+                // That is free while there is headroom and harmful once there
+                // is not: each pause taken under pressure is a pause the engine
+                // could not use to recover, so usage ratchets up across a
+                // session instead of oscillating. Once this engine reaches
+                // budget mode 3 it has never been observed to return to 1.
+                // A tester reported exactly that shape — good at first, steadily
+                // worse over two hours of play.
+                //
+                // So the freeze now only runs while the engine is comfortable,
+                // and stands down for the REST OF THIS PAUSE the moment it is
+                // not. Latched rather than re-evaluated so we cannot oscillate:
+                // freeze, engine sheds, headroom returns, freeze again.
+                if (g_freezeStoodDownSession.load(std::memory_order_relaxed) == session) {
+                    // Count once per LOD cycle (the CheckBudget visit), not
+                    // once per hooked visit — the verdict line is read by
+                    // humans and a per-visit count reads as tens of thousands
+                    // for one long pause.
+                    if (frozen == FrozenState::CheckBudget) {
+                        g_pressureStandDowns.fetch_add(1, std::memory_order_relaxed);
                     }
+                    return false;
+                }
+                // minFreezeHeadroomBytes == 0 disables the headroom half
+                // outright (documented in the INI); the mode check remains.
+                const bool underPressure =
+                    bud.mode > g_cfg.maxFreezeMode
+                    || (g_cfg.minFreezeHeadroomBytes != 0 && bud.target != 0
+                        && bud.usage + g_cfg.minFreezeHeadroomBytes > bud.target);
+                if (underPressure) {
+                    if (frozen == FrozenState::CheckBudget) {
+                        g_pressureStandDowns.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (session != 0
+                        && g_freezeStoodDownSession.exchange(session, std::memory_order_relaxed)
+                           != session) {
+                        // A stood-down pause must NOT get the one-shot RELEASE
+                        // Reset at close: the engine is running natively and
+                        // possibly mid-demote, and that Reset would zero
+                        // totalDegrade — aborting the recovery this stand-down
+                        // exists to allow. Clear any pending release from
+                        // frozen visits earlier in this same pause, and the
+                        // post-close catch below also skips latched sessions.
+                        g_pendingPostPauseReset.store(0, std::memory_order_relaxed);
+                        Sample s{};
+                        s.tMs = now;
+                        s.session = session;
+                        s.mode = bud.mode;
+                        s.refreshAll = 0xFB;   // pressure stand-down marker
+                        s.inMenu = true;
+                        s.budget = bud.budget;
+                        s.usage = bud.usage;
+                        s.target = bud.target;
+                        PushSample(s);
+                    }
+                    return false;
                 }
 
                 g_pendingPostPauseReset.store(session, std::memory_order_relaxed);
@@ -407,7 +546,6 @@ namespace slh::Hook
 
                 if (session != 0
                     && g_loggedFreezeSession.exchange(session, std::memory_order_relaxed) != session) {
-                    const BudgetRead bud = ReadBudget();
                     Sample marker{};
                     marker.tMs = now;
                     marker.session = session;
@@ -432,7 +570,6 @@ namespace slh::Hook
                          && (now - g_lastSampleMs.load(std::memory_order_relaxed))
                             >= static_cast<std::int64_t>(g_cfg.timelinePeriodMs)) {
                     g_lastSampleMs.store(now, std::memory_order_relaxed);
-                    const BudgetRead bud = ReadBudget();
                     Sample s{};
                     s.tMs = now;
                     s.session = session;
@@ -459,9 +596,13 @@ namespace slh::Hook
             auto pending = g_pendingPostPauseReset.load(std::memory_order_relaxed);
             const auto openedAt = MenuWatcher::LastOpenTimeMs();
             const auto closedAt = MenuWatcher::LastCloseTimeMs();
-            if (session != 0 && closedAt >= openedAt && closedAt != 0 && pending != session) {
+            if (session != 0 && closedAt >= openedAt && closedAt != 0 && pending != session
+                && g_freezeStoodDownSession.load(std::memory_order_relaxed) != session) {
                 // Covers a very short pause that opens and closes entirely
-                // between two state-action visits.
+                // between two state-action visits. Stood-down sessions are
+                // excluded: the engine ran natively through them (possibly
+                // mid-demote), so there is no pause-sampled work to discard and
+                // a Reset here would zero totalDegrade during recovery.
                 pending = session;
                 g_pendingPostPauseReset.store(pending, std::memory_order_relaxed);
             }
@@ -767,6 +908,19 @@ namespace slh::Hook
                 g_ringRead = w - kRingSize;
             }
             while (g_ringRead < w) {
+                // Re-check for lapping every iteration, not just at entry:
+                // each drained line is a synchronous flush (flush_on(info)),
+                // so this loop's duration scales with disk latency, and a
+                // fast producer can wrap the ring while we are mid-drain.
+                // Copying a slot the producer has re-claimed would emit a
+                // torn, plausible-looking row.
+                const auto claimed = g_ringWrite.load(std::memory_order_relaxed);
+                if (claimed - g_ringRead >= kRingSize) {
+                    spdlog::warn("[timeline] producer lapped the drain mid-loop — skipping {} "
+                                 "samples to resynchronise", w - g_ringRead);
+                    g_ringRead = w;
+                    break;
+                }
                 const Sample s = g_ring[g_ringRead % kRingSize];
                 ++g_ringRead;
 
@@ -788,6 +942,15 @@ namespace slh::Hook
                     continue;
                 }
 
+                if (s.refreshAll == 0xFB) {   // VRAM pressure stand-down
+                    spdlog::warn("[freeze] STAND DOWN session={} — VRAM pressure (mode={} "
+                                 "usage={:.0f}MB target={:.0f}MB). The engine needs to shed "
+                                 "textures and demotion is its only way to do that, so the "
+                                 "freeze is off for the rest of this pause.",
+                                 s.session, s.mode, MB(s.usage), MB(s.target));
+                    continue;
+                }
+
                 if (s.refreshAll == 0xFE) {   // latch marker row
                     spdlog::info("[hold] STAND DOWN ({}) mode={} — degrade hold off for the rest of this menu",
                                  LatchName(s.action), s.mode);
@@ -800,12 +963,12 @@ namespace slh::Hook
                     spdlog::warn("[EVENT] refreshAll={} mode={} menu={} cooldown={} pressure={} action={} "
                                  "| vram usage={:.0f}MB budget={:.0f}MB target={:.0f}MB "
                                  "| upgrade mesh/texture/combined={:.0f}/{:.0f}/{:.0f}MB "
-                                 "totalDegrade={:.0f}MB",
+                                 "totalDegrade={:.0f}MB{}",
                                  s.refreshAll, s.mode, s.inMenu, s.cooldown, s.pressureGuard,
                                  ActionName(s.action),
                                  MB(s.usage), MB(s.budget), MB(s.target),
                                  MB(s.meshUpgrade), MB(s.textureUpgrade), MB(s.combinedUpgrade),
-                                 MB(s.totalDegrade));
+                                 MB(s.totalDegrade), OsVram(s));
                 } else {
                     spdlog::info("[tl] mode={} menu={} cd={} pressure={} act={} "
                                  "refreshAll={} emerg={} demote={} "
@@ -840,6 +1003,10 @@ namespace slh::Hook
             spdlog::info("[verdict] refreshAll seen SET by engine: {}  (cleared by us: {})", obs, clr);
             spdlog::info("[verdict] upgrade-budget caps          : {}", caps);
             spdlog::info("[verdict] degrade holds (mode 1, menu) : {}", holds);
+            const auto pressure = g_pressureStandDowns.load();
+            spdlog::info("[verdict] LOD cycles under pressure stand-down: {}{}", pressure,
+                         pressure ? "  — the engine was near or over its texture target while "
+                                    "paused, so the freeze got out of the way and let it demote" : "");
             const auto teardown = g_teardownSkips.load();
             if (teardown != 0) {
                 spdlog::info("[verdict] redirects declined (teardown): {}  — the LOD subsystem "
@@ -863,9 +1030,13 @@ namespace slh::Hook
                              "This build deliberately caused the bug.", forced);
             }
             if (g_cfg.freezeLODWhilePaused && frozen > 0) {
-                spdlog::info("[verdict] => Exact PauseMenu freeze DID run. Each counted state "
-                             "would have promoted or degraded mesh/texture LOD; it was redirected "
-                             "through the native Reset transition instead.");
+                // Careful wording: while frozen, CheckBudget never dispatches,
+                // so the counted visits are almost entirely CheckBudget polls —
+                // they measure how often the LOD machine WOULD have run, not
+                // how many promote/demote batches were prevented.
+                spdlog::info("[verdict] => Exact PauseMenu freeze DID run: {} LOD-machine visits "
+                             "during pauses were redirected through the native Reset transition "
+                             "instead of executing.", frozen);
             } else if (g_cfg.freezeLODWhilePaused && releases > 0) {
                 spdlog::info("[verdict] => Exact PauseMenu was observed and the release Reset ran. "
                              "No hooked LOD-changing state visited while the menu was open, so "
@@ -900,6 +1071,7 @@ namespace slh::Hook
             }
 
             auto next_summary = std::chrono::steady_clock::now();
+            auto lastSummary  = next_summary;
             auto next_health  = next_summary;
             auto lastHealth   = next_summary;
             auto next_verdict = next_summary + std::chrono::seconds(g_cfg.verdictIntervalSec);
@@ -1004,6 +1176,36 @@ namespace slh::Hook
                 const std::int64_t nowMs = NowMs();
                 const bool inMenu = MenuWatcher::IsSuspendingMenuOpen();
 
+                // Once the engine wants to quit, this thread STOPS ENTIRELY.
+                //
+                // Everything below touches something the shutdown is busy
+                // destroying: ReadBudget walks the engine's VRAM singleton,
+                // os.Sample() calls QueryVideoMemoryInfo on the graphics
+                // adapter while D3D is tearing the device down, and every log
+                // line is disk I/O competing with the engine's own writes.
+                // Gating only the LOD redirects left all of this running,
+                // which is why a tester still saw a slow exit that stopped
+                // when the plugin was removed.
+                //
+                // Write the final verdict, drop DXGI, and end the thread so
+                // nothing of ours remains for the rest of the shutdown.
+                if (MenuWatcher::EngineShutdownRequested()) {
+                    if (pr.pending && !pr.open) {
+                        emitPauseReport("TRUNCATED (quit requested)");
+                    }
+                    DrainTimeline();
+                    LogVerdict("quit requested");
+                    spdlog::info("[hook] diagnostics stopped — no further engine, driver or log "
+                                 "activity from this plugin during shutdown");
+                    spdlog::default_logger()->flush();
+                    os.Release();
+                    // Read the singleton BEFORE it is torn down. If the pipeline
+                    // cache is clean this terminates the process here; otherwise
+                    // it returns and the game shuts down normally to persist it.
+                    MaybeFastExit();
+                    return;
+                }
+
                 DrainTimeline();
 
                 if (now >= next_health) {
@@ -1013,8 +1215,14 @@ namespace slh::Hook
                     const auto act   = g_actionCalls.load(std::memory_order_relaxed);
                     if (dtMs > 0) {
                         const double rate = static_cast<double>(total - healthPrevTotal) * 1000.0 / static_cast<double>(dtMs);
-                        rateRing[rateCount % rateRing.size()] = { nowMs, rate };
-                        ++rateCount;
+                        // Gameplay samples only. In-menu rates are frozen-visit
+                        // throughput, and storing them would pollute the next
+                        // pause-report's pre-pause median when pauses come
+                        // back-to-back.
+                        if (!inMenu) {
+                            rateRing[rateCount % rateRing.size()] = { nowMs, rate };
+                            ++rateCount;
+                        }
                         const bool intervening = (act - healthPrevAct) > 0;
 
                         if (!inMenu) {
@@ -1088,13 +1296,21 @@ namespace slh::Hook
                     // which is why one v0.8 tester session could never be
                     // explained. calls=0 means the renderer is not ticking.
                     {
+                        // Measured elapsed, not the configured interval — the
+                        // wall time between summaries stretches whenever the
+                        // diag thread stalls in synchronous log flushes, and a
+                        // rate computed against the nominal interval would
+                        // silently overstate throughput in exactly those
+                        // moments.
+                        const auto sumDt = std::max<std::int64_t>(1,
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSummary).count());
                         spdlog::info("[summary] last {}ms — calls={} (acted={}, pass={})  rate={:.1f}/s  "
                                      "baseline={:.1f}/s  refreshSeen={} refreshCleared={} "
                                      "pausedStateSkips={} (+{}) postPauseResets={} "
                                      "upgradeCaps={} degradeHolds={} pressureGuard={}  "
                                      "mode histogram[0/1/2/3]={}/{}/{}/{}",
-                                     g_cfg.summaryIntervalMs, dTotal, act - prevAct, pass - prevPass,
-                                     static_cast<double>(dTotal) * 1000.0 / static_cast<double>(g_cfg.summaryIntervalMs),
+                                     sumDt, dTotal, act - prevAct, pass - prevPass,
+                                     static_cast<double>(dTotal) * 1000.0 / static_cast<double>(sumDt),
                                      g_baselineRate.load(std::memory_order_relaxed),
                                      g_refreshObserved.load(std::memory_order_relaxed),
                                      g_refreshClears.load(std::memory_order_relaxed),
@@ -1110,6 +1326,7 @@ namespace slh::Hook
                     }
                     prevTotal = total; prevAct = act; prevPass = pass;
                     prevFrozen = frozen;
+                    lastSummary  = now;
                     next_summary = now + std::chrono::milliseconds(g_cfg.summaryIntervalMs);
                 }
 
@@ -1283,7 +1500,16 @@ namespace slh::Hook
 
         bool freezeResolved = false;
         if (cfg.freezeLODWhilePaused) {
-            if (!MenuWatcher::ExactPauseMenuDetectionReady()) {
+            if (!prologueOk) {
+                // The prologue bytes encode the exact layout this plugin's
+                // model of the engine depends on. A mismatch means this binary
+                // differs from the one we verified — and the freeze redirects
+                // native code using that model. Disabling only WRITES (as the
+                // legacy holds do) is not enough for the freeze; refuse it.
+                spdlog::error("[freeze] CheckBudget prologue did not verify on this runtime — "
+                              "state freeze DISABLED along with writes; this build of the game "
+                              "does not match the layout this plugin was verified against");
+            } else if (!MenuWatcher::ExactPauseMenuDetectionReady()) {
                 spdlog::error("[freeze] exact UI::IsMenuOpen(\"PauseMenu\") detector unavailable — "
                               "state freeze DISABLED; cursor fallback is intentionally not trusted");
             } else if (!MenuWatcher::QuitDetectionReady()) {
@@ -1446,15 +1672,18 @@ namespace slh::Hook
         }
 
         g_shutdown.store(false);
-        g_diagThread = std::thread(DiagLoop);
+        std::thread(DiagLoop).detach();   // see the comment on g_shutdown
         return true;
     }
 
     void Shutdown()
     {
         if (!g_installed.exchange(false)) return;
+        // The diag thread is detached; signalling is all that can be done. It
+        // exits on its own within one 25ms iteration. (This function has no
+        // callers — teardown is the quit-flag dormancy path — but keep it
+        // coherent for anyone who wires it up later.)
         g_shutdown.store(true);
-        if (g_diagThread.joinable()) g_diagThread.join();
         g_pauseFreezeReady.store(false, std::memory_order_release);
         for (auto it = g_hookTargets.rbegin(); it != g_hookTargets.rend(); ++it) {
             MH_DisableHook(reinterpret_cast<LPVOID>(*it));

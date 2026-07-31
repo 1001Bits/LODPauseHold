@@ -44,6 +44,27 @@ namespace slh
     // teardown guard: the engine's own quit-requested flag (Main::Singleton
     // +0x28) makes the freeze stand down the moment a quit is requested, which
     // is what stopped it redirecting into the engine during shutdown.
-    inline constexpr std::uint32_t kPluginVersion = (1u << 24) | (0u << 16) | (0u << 4) | 0u;
+    // v1.1.0 → VRAM pressure gate. The freeze redirects every LOD state through
+    // Reset, which also zeroes totalDegrade, so a paused engine could not demote
+    // at all — its only route back from VRAM pressure. Harmless with headroom,
+    // compounding without it. The freeze now stands down for the rest of a pause
+    // whenever the engine needs to shed.
+    // v1.1.0 adds, over 1.0.0:
+    //  - VRAM pressure gate: the freeze stands down for the rest of a pause
+    //    whenever the engine needs to shed textures, because redirecting every
+    //    LOD state through Reset also zeroes totalDegrade — the engine's only
+    //    route back from VRAM pressure.
+    //  - Dormancy on quit: both worker threads exit the moment the engine's
+    //    quit flag is set, so nothing of ours touches the engine, the graphics
+    //    driver or the disk during shutdown.
+    //  - Fast quit to desktop: the exit teardown re-serializes the whole D3D12
+    //    pipeline cache and walks its heap (up to a minute). TerminateProcess
+    //    skips it, gated on the engine's own pipeline-dirty byte so a session
+    //    that compiled new shaders still persists them that once.
+    //  - Audit fixes: detached worker threads (a joinable static std::thread
+    //    would call std::terminate at process detach), freeze refuses to
+    //    install when prologue verification fails, no stray release Reset
+    //    after a stood-down pause, and honest diagnostic counters.
+    inline constexpr std::uint32_t kPluginVersion = (1u << 24) | (1u << 16) | (0u << 4) | 0u;
     inline constexpr const char* kPluginNameC = "StarfieldPauseLODHold";
 }

@@ -12,6 +12,14 @@ dist/
 evidence/
 *.log
 
+# Build artefacts anywhere, including stray copies left in the repo root by a
+# manual deploy. Binaries belong on the Releases page, never in the tree.
+*.dll
+*.exe
+*.pdb
+*.lib
+*.exp
+
 # Editor / tooling
 .claude/
 .vs/
